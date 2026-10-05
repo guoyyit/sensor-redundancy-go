@@ -30,6 +30,9 @@ for r := range eng.Results() {
 // 任一时刻的完整自洽状态（同一采样拍，不会跨通道混合）。
 view := eng.Snapshot()
 
+// 停机排空对账：接受数、丢弃数、处理数、产出数。
+stats := eng.Stats()
+
 // 阈值/恢复窗口可在线调整；通道集合不可变，计数与状态不重置。
 cfg.DriftThreshold = 2.0
 _ = eng.UpdateConfig(cfg)
@@ -86,17 +89,54 @@ results, err := sensor.Replay(cfg, samples)
 ## 并发一致性
 
 - 多个生产者可并发 `Submit`；内部仅一个后台 goroutine 串行推进状态。
+- **同一采样时刻自洽**：采样序号、表决结果与各通道健康状态在同一把锁内
+  更新，`Snapshot()` 读到的三元组必然完整属于同一个已完成的采样拍，
+  持续写入与并发读取交错也不会出现相邻两拍的混合视图；读取不阻塞写入。
 - 帧按 `Seq` 组装：只有当每通道“已有该拍读数”或“已确认越过该序号
-  （整拍缺数）”时才关闭，正在管道中并发投递的正常样本不会被误判缺失；
-  迟到的低序号读数一律丢弃，杜绝跨通道、跨采样时刻混合。
-- `Snapshot()` 读到的状态必然对应某个已完整处理完的采样拍。
+  （整拍缺数）”时才关闭，正在管道中并发投递的正常样本不会被误判缺失。
+- **封闭时刻凝固**：已产出表决结果的采样时刻视为封闭，之后到达的迟到、
+  重复、乱序读数一律确定性丢弃，不会再次产出该时刻的结果，也不会改写
+  已发布的输出；同一时刻同一通道重复上报时只有首次接收的读数生效。
+  已隔离通道的恢复因此只依据新到达的连续采样时刻推进，重复投递旧读数
+  不计入连续匹配。
+- **有界等待**：待处理帧跨度（最新已见序号 − 最旧待处理序号）超过
+  `MaxPendingFrames` 时，最旧帧按当时实际到位的通道集合确定性结算
+  （输出为 `degraded`/`failed`，`Contributors` 即实际到位集合）。
+  单通道长期缺报不会无限积压，推进规则只依赖采样序号，不依赖墙钟
+  或到达时延，相同输入下可复现。
+
+## 停机排空与对账
+
+`Close()` 的语义：
+
+1. 停止接受新样本：之后（以及停机过程中）的 `Submit` 要么已被完整接受
+   并处理，要么收到明确的 `engine closed` 错误，绝不静默丢弃。
+2. 所有已接受样本全部处理完毕：输入管道排空后，收集器中仍缓冲的帧
+   逐帧结算（按实际到位通道输出），一个不漏。
+3. 最终状态完整落盘后 `Close` 才返回；落盘错误会作为返回值上报。
+
+`Stats()` 提供对账计数，不变式：
+
+```
+Accepted == Dropped + SamplesProcessed   // 接受的样本要么被丢弃（迟到/重复），要么参与表决
+FramesProcessed == 产出的表决结果数
+结果通道实际投递数 == FramesProcessed - ResultsDropped
+```
+
+结果通道缓冲有界（256）；消费者过慢时丢弃最旧结果并计入
+`ResultsDropped`，写入侧永不阻塞，权威状态以 `Snapshot()`/落盘快照为准。
+
+正常停机后重启：从最后对外可见的采样时刻继续衔接——已封闭时刻的重复
+样本被确定性丢弃（不重复处理），未处理的样本不跳过，`Snapshot()` 与
+停机前最后一次对外可见状态（序号、结果、健康状态）完全一致。
 
 ## 崩溃恢复
 
 每拍处理完成后原子写入快照（临时文件 + `rename`），内容含：采样序号、
 配置、各通道状态与连续计数、每通道有界历史（上限 `HistorySize`）、
-最近可靠参考。重启后故障通道仍为 `faulty`，必须重新走完恢复窗口才会
-纳入；磁盘快照与运行配置的通道集合不一致时启动报错，绝不静默重纳。
+最近可靠参考与最后一次表决结果。重启后故障通道仍为 `faulty`，必须重新
+走完恢复窗口才会纳入；磁盘快照与运行配置的通道集合不一致时启动报错，
+绝不静默重纳。
 
 ## 配置项（`config.go`）
 
@@ -112,6 +152,7 @@ results, err := sensor.Replay(cfg, samples)
 | `RecoverAfter` | 3 | 隔离后连续匹配多少次重新纳入 |
 | `MinHealthy` | 2 | 允许输出的最少可用通道数 |
 | `HistorySize` | 16 | 每通道有界历史长度（须 ≥ StuckWindow+1） |
+| `MaxPendingFrames` | 64 | 最大待处理帧跨度；0 表示取默认值，超限时最旧帧按实际到位通道确定性结算 |
 
 `UpdateConfig` 可在线修改阈值与窗口：参数下一拍生效，既有的健康状态
 与连续计数原样保留，因此修改前后输出不会出现无解释跳变；通道集合不允许
@@ -120,5 +161,29 @@ results, err := sensor.Replay(cfg, samples)
 ## 确定性复现
 
 `Replay` 不接触墙钟、goroutine 与文件：帧按 `Seq` 分组升序处理，
-帧内按配置通道顺序推进健康状态。相同采样序列与配置下，状态迁移与
-表决输出逐条一致，可用于回放并复现故障隔离过程。
+帧内按配置通道顺序推进健康状态；同一时刻同一通道的重复样本与在线
+一样只取首次读数。相同采样序列与相同配置下，在线运行、停机排空与
+离线回放给出逐条一致的表决结果与状态迁移；相同输入重复执行多次，
+结果完全一致。
+
+## 本地验证
+
+```sh
+# 全部单元测试与场景测试
+go test ./...
+
+# 并发读写一致性（数据竞争检测）与多次重复运行稳定性
+go test -race -count=10 ./...
+```
+
+关键验收用例：
+
+- `TestConcurrentReadWriteAtomicSnapshot`：并发读写下 Snapshot 同拍自洽；
+- `TestLateDuplicateOutOfOrderDropped`：迟到/重复/乱序样本确定性丢弃；
+- `TestIsolatedChannelDuplicateOldReadingsIgnored`：重复旧读数不推进恢复；
+- `TestShutdownDrainsAllAccepted` / `TestSubmitDuringCloseIsDecisive`：
+  停机排空、接受/拒绝明确、计数对账；
+- `TestRestartContinuesFromLastVisible`：停机重启后与最后可见状态一致；
+- `TestOnlineDrainReplayConsistency`：在线/排空/回放逐条一致；
+- `TestSlowConsumerBounded` / `TestStalledChannelForcesDeterministicProgress`：
+  慢消费者不阻塞写入、内存有界、单通道缺报确定性推进。
