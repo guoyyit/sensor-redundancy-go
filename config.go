@@ -25,21 +25,30 @@ type Config struct {
 	MinHealthy int
 	// HistorySize 每通道保留的近期采样历史长度（有界）。
 	HistorySize int
+	// MaxPendingFrames 允许的最大待处理帧跨度（最新已见序号与最旧待处理
+	// 帧序号之差）。超过该跨度时最旧帧按实际到位通道确定性地结算，
+	// 防止单通道长期缺报导致无限积压。0 表示使用默认值。
+	// 推进规则只依赖采样序号，不依赖墙钟或到达时延。
+	MaxPendingFrames int
 }
+
+// defaultMaxPendingFrames 是 MaxPendingFrames 的默认取值。
+const defaultMaxPendingFrames = 64
 
 // DefaultConfig 返回给定通道集合下的默认配置。
 func DefaultConfig(channels []ChannelID) Config {
 	return Config{
-		Channels:       append([]ChannelID(nil), channels...),
-		DriftThreshold: 1.0,
-		JumpThreshold:  5.0,
-		StuckEpsilon:   1e-9,
-		StuckWindow:    5,
-		SuspectAfter:   2,
-		FaultAfter:     3,
-		RecoverAfter:   3,
-		MinHealthy:     2,
-		HistorySize:    16,
+		Channels:         append([]ChannelID(nil), channels...),
+		DriftThreshold:   1.0,
+		JumpThreshold:    5.0,
+		StuckEpsilon:     1e-9,
+		StuckWindow:      5,
+		SuspectAfter:     2,
+		FaultAfter:       3,
+		RecoverAfter:     3,
+		MinHealthy:       2,
+		HistorySize:      16,
+		MaxPendingFrames: defaultMaxPendingFrames,
 	}
 }
 
@@ -85,7 +94,19 @@ func (c Config) Validate() error {
 	if c.HistorySize < c.StuckWindow+1 {
 		return fmt.Errorf("sensor: HistorySize must be >= StuckWindow+1")
 	}
+	if c.MaxPendingFrames < 0 {
+		return fmt.Errorf("sensor: MaxPendingFrames must be non-negative (0 means default)")
+	}
 	return nil
+}
+
+// normalized 填充缺省值：MaxPendingFrames 为 0 时取默认值。
+// 使手工构造的零值配置无需迁移即可运行。
+func (c Config) normalized() Config {
+	if c.MaxPendingFrames <= 0 {
+		c.MaxPendingFrames = defaultMaxPendingFrames
+	}
+	return c
 }
 
 // clone 返回配置的深拷贝，避免在线调整时共享底层切片。

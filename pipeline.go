@@ -111,10 +111,12 @@ func (p *pipeline) snapshot(seq int64) snapshot {
 		History:     p.hist.snapshot(p.cfg.Channels),
 		LastGoodRef: p.lastGoodRef,
 		HasGoodRef:  p.hasGoodRef,
+		LastResult:  voteResultToSnapshot(p.lastResult),
 	}
 }
 
 // restore 用快照恢复状态，通道集合由调用方保证一致。
+// 最后一次对外可见的表决结果一并还原：重启后 Snapshot 与停机前一致。
 func (p *pipeline) restore(snap snapshot) {
 	for _, ch := range p.cfg.Channels {
 		if st, ok := snap.Statuses[ch]; ok {
@@ -124,4 +126,5 @@ func (p *pipeline) restore(snap snapshot) {
 	p.hist.restore(snap.History)
 	p.lastGoodRef = snap.LastGoodRef
 	p.hasGoodRef = snap.HasGoodRef
+	p.lastResult = snap.LastResult.toVoteResult()
 }

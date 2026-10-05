@@ -31,7 +31,8 @@ func Replay(cfg Config, samples []Sample) ([]VoteResult, error) {
 }
 
 // groupFrames 把扁平采样序列按 Seq 分组。
-// 同一通道在同一 Seq 出现多次时保留最后一次（与在线覆盖语义一致）。
+// 同一通道在同一 Seq 出现多次时保留首次接收的读数，
+// 与在线收集器的“首达生效、重复丢弃”语义一致。
 func groupFrames(channels []ChannelID, samples []Sample) map[int64]map[ChannelID]Sample {
 	frames := make(map[int64]map[ChannelID]Sample)
 	known := make(map[ChannelID]struct{}, len(channels))
@@ -47,7 +48,9 @@ func groupFrames(channels []ChannelID, samples []Sample) map[int64]map[ChannelID
 			frame = make(map[ChannelID]Sample)
 			frames[s.Seq] = frame
 		}
-		frame[s.Channel] = s
+		if _, exists := frame[s.Channel]; !exists {
+			frame[s.Channel] = s
+		}
 	}
 	return frames
 }

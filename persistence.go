@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 )
 
-// snapshot 是需要持久化的最小状态：健康状态、计数与有界历史。
+// snapshot 是需要持久化的最小状态：健康状态、计数、有界历史与
+// 最后一次对外可见的表决结果。
 // 配置同时落盘：恢复时若与运行配置冲突会显式报错，而非静默重纳故障通道。
 type snapshot struct {
 	Seq         int64                       `json:"seq"`
@@ -17,6 +19,52 @@ type snapshot struct {
 	History     map[ChannelID][]Sample      `json:"history"`
 	LastGoodRef float64                     `json:"last_good_ref"`
 	HasGoodRef  bool                        `json:"has_good_ref"`
+	LastResult  voteResultSnapshot          `json:"last_result"`
+}
+
+// voteResultSnapshot 是 VoteResult 的 JSON 安全表示：
+// 失效结果的 Value 为 NaN，无法直接编码为 JSON，用 HasValue 显式标记。
+type voteResultSnapshot struct {
+	Seq          int64       `json:"seq"`
+	Value        float64     `json:"value"`
+	HasValue     bool        `json:"has_value"`
+	Status       VoteStatus  `json:"status"`
+	Contributors []ChannelID `json:"contributors,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
+}
+
+func voteResultToSnapshot(r VoteResult) voteResultSnapshot {
+	v := voteResultSnapshot{
+		Seq:          r.Seq,
+		Value:        r.Value,
+		HasValue:     true,
+		Status:       r.Status,
+		Contributors: r.Contributors,
+		Reason:       r.Reason,
+	}
+	if math.IsNaN(r.Value) {
+		v.Value = 0
+		v.HasValue = false
+	}
+	return v
+}
+
+func (v voteResultSnapshot) toVoteResult() VoteResult {
+	if v.Status == "" {
+		// 旧版本快照没有该字段：视为“尚无结果”，与全新引擎一致。
+		return VoteResult{}
+	}
+	r := VoteResult{
+		Seq:          v.Seq,
+		Value:        v.Value,
+		Status:       v.Status,
+		Contributors: v.Contributors,
+		Reason:       v.Reason,
+	}
+	if !v.HasValue {
+		r.Value = math.NaN()
+	}
+	return r
 }
 
 // persist 将快照原子写入 path：先写临时文件再 rename，
