@@ -23,6 +23,9 @@ func newPipeline(cfg Config) *pipeline {
 		voter:    newVoter(cfg),
 		hist:     newHistory(cfg.HistorySize),
 		statuses: make(map[ChannelID]ChannelStatus, len(cfg.Channels)),
+		// 尚无已完成采样拍时的占位结果：Seq=-1 与引擎初始序号一致，
+		// 保证 Snapshot 读到的 Seq 与 Result.Seq 始终相等。
+		lastResult: VoteResult{Seq: -1, Status: StatusFailed, Reason: "no completed tick"},
 	}
 	for _, ch := range cfg.Channels {
 		p.statuses[ch] = newChannelStatus()
@@ -111,10 +114,12 @@ func (p *pipeline) snapshot(seq int64) snapshot {
 		History:     p.hist.snapshot(p.cfg.Channels),
 		LastGoodRef: p.lastGoodRef,
 		HasGoodRef:  p.hasGoodRef,
+		LastResult:  toResultSnapshot(p.lastResult),
 	}
 }
 
 // restore 用快照恢复状态，通道集合由调用方保证一致。
+// 恢复后最后对外结果与停机前最后一拍一致，重启衔接不重复、不跳拍。
 func (p *pipeline) restore(snap snapshot) {
 	for _, ch := range p.cfg.Channels {
 		if st, ok := snap.Statuses[ch]; ok {
@@ -124,4 +129,12 @@ func (p *pipeline) restore(snap snapshot) {
 	p.hist.restore(snap.History)
 	p.lastGoodRef = snap.LastGoodRef
 	p.hasGoodRef = snap.HasGoodRef
+	switch {
+	case snap.LastResult != nil:
+		p.lastResult = snap.LastResult.toVoteResult()
+	case snap.Seq >= 0:
+		// 旧版本快照不含最后结果：合成与 Seq 自洽的占位结果，
+		// 保证恢复视图不出现跨拍混合。
+		p.lastResult = VoteResult{Seq: snap.Seq, Status: StatusFailed, Reason: "restored from snapshot without result"}
+	}
 }

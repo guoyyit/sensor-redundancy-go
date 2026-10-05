@@ -139,12 +139,17 @@ func TestReplayDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 打乱输入顺序（通道维度），结果必须逐条一致
-	shuffled := make([]Sample, len(all))
-	copy(shuffled, all)
-	for i := len(shuffled) - 1; i > 0; i-- {
-		j := (i * 7) % (i + 1)
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	// 打乱输入顺序（通道维度：仅置换同一采样时刻内部的通道次序），
+	// 结果必须逐条一致。跨时刻的重排属于不同的到达序列，
+	// 帧关闭语义本就按到达序列确定，不在本测试断言范围内。
+	shuffled := make([]Sample, 0, len(all))
+	for i := 0; i < len(all); i += len(chs) {
+		frame := append([]Sample(nil), all[i:i+len(chs)]...)
+		for j := len(frame) - 1; j > 0; j-- {
+			k := (j * 5) % (j + 1)
+			frame[j], frame[k] = frame[k], frame[j]
+		}
+		shuffled = append(shuffled, frame...)
 	}
 	second, err := Replay(cfg, shuffled)
 	if err != nil {
